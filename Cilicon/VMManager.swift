@@ -89,6 +89,7 @@ class VMManager: NSObject, ObservableObject {
         }.value
     }
 
+    @MainActor
     private func setupAndRunVirtualMachine() async throws {
         if !config.editorMode {
             try await cloneBundle()
@@ -98,10 +99,9 @@ class VMManager: NSObject, ObservableObject {
         let virtualMachine = VZVirtualMachine(configuration: vmConfig)
         virtualMachine.delegate = self
 
-        Task { @MainActor in
-            vmState = .running(virtualMachine)
-            try await virtualMachine.start()
-        }
+        try await virtualMachine.start()
+        vmState = .running(virtualMachine)
+
         if config.editorMode {
             return
         }
@@ -124,9 +124,9 @@ class VMManager: NSObject, ObservableObject {
             for try await blob in streamOutput {
                 switch blob {
                 case let .stdout(stdout):
-                    await SSHLogger.shared.log(string: String(buffer: stdout))
+                    SSHLogger.shared.log(string: String(buffer: stdout))
                 case let .stderr(stderr):
-                    await SSHLogger.shared.log(string: String(buffer: stderr))
+                    SSHLogger.shared.log(string: String(buffer: stderr))
                 }
             }
         }
@@ -144,14 +144,14 @@ class VMManager: NSObject, ObservableObject {
             for try await blob in streamOutput {
                 switch blob {
                 case let .stdout(stdout):
-                    await SSHLogger.shared.log(string: String(buffer: stdout))
+                    SSHLogger.shared.log(string: String(buffer: stdout))
                 case let .stderr(stderr):
-                    await SSHLogger.shared.log(string: String(buffer: stderr))
+                    SSHLogger.shared.log(string: String(buffer: stderr))
                 }
             }
         }
 
-        await SSHLogger.shared.log(string: "---------- Shutting Down ----------\n")
+        SSHLogger.shared.log(string: "---------- Shutting Down ----------\n")
         try await client.close()
 
         Task { @MainActor in
