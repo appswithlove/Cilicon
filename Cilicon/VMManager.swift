@@ -1,3 +1,4 @@
+import AsyncHTTPClient
 import Citadel
 import Compression
 import Foundation
@@ -20,6 +21,8 @@ class VMManager: NSObject, ObservableObject {
 
     @Published
     var vmState: VMState = .initializing
+
+    @MainActor private var progresses: [Double] = []
 
     init(config: Config) {
         switch config.provisioner {
@@ -47,9 +50,13 @@ class VMManager: NSObject, ObservableObject {
             }
 
             if case let .OCI(ociURL) = config.source {
-                let resolvedPath = masterBundle.url.resolvingSymlinksInPath().path
-                if try fileManager.fileExists(atPath: resolvedPath) && !isBundleComplete() {
-                    try fileManager.removeItem(atPath: resolvedPath)
+                let resolvedPath = masterBundle.url.resolvingSymlinksInPath().appendingPathComponent("disk").appendingPathExtension("img").path
+                if fileManager.fileExists(atPath: resolvedPath) {
+                    if isBundleComplete() {
+                        removeDownloadedChunks()
+                    } else {
+                        try fileManager.removeItem(atPath: resolvedPath)
+                    }
                 }
                 if !fileManager.fileExists(atPath: resolvedPath) {
                     try await withTaskCancellationHandler(operation: {
@@ -153,7 +160,7 @@ class VMManager: NSObject, ObservableObject {
         }
     }
 
-    func isBundleComplete() throws -> Bool {
+    func isBundleComplete() -> Bool {
         let filesExist = [
             masterBundle.diskImageURL,
             masterBundle.configURL,
@@ -190,6 +197,11 @@ class VMManager: NSObject, ObservableObject {
         }
     }
 
+    func removeDownloadedChunks() {
+        let chunksPath = masterBundle.url.resolvingSymlinksInPath().appendingPathComponent("chunks")
+        try? fileManager.removeItem(at: chunksPath)
+    }
+
     func cleanup() throws {
         try removeBundleIfExists()
     }
@@ -215,43 +227,7 @@ class VMManager: NSObject, ObservableObject {
         }
         let configData = try await client.pullBlobData(digest: configLayer.digest)
         try configData.write(to: bundleForPaths.configURL)
-        // Fetching images
 
-        let totalSize = manifest.layers.map(\.size).reduce(into: Int64(0), +=)
-
-        let bufferSizeBytes = 64 * 1024 * 1024
-
-        let diskURL = bundleForPaths.diskImageURL
-        fileManager.createFile(atPath: diskURL.path, contents: nil)
-
-        let disk = try FileHandle(forWritingTo: diskURL)
-        let filter = try OutputFilter(.decompress, using: .lz4, bufferCapacity: bufferSizeBytes) { data in
-            if let data {
-                disk.write(data)
-            }
-        }
-
-        let imgLayers = manifest.layers.filter { $0.mediaType == "application/vnd.cirruslabs.tart.disk.v1" }
-        var lastDataCount = 0
-        var lastProgress: Double = -1
-        for (index, layer) in imgLayers.enumerated() {
-            var data = Data()
-            data.reserveCapacity(Int(layer.size))
-            for try await byte in try await client.pullBlob(digest: layer.digest) {
-                data.append(byte)
-                let progress = Double(data.count + lastDataCount) / Double(totalSize)
-                if progress - lastProgress > 0.001 {
-                    lastProgress = progress
-                    Task { @MainActor in
-                        vmState = .downloading(text: "disk image layer \(index + 1)/\(imgLayers.count)", progress: progress)
-                    }
-                }
-            }
-            lastDataCount += data.count
-            try filter.write(data)
-        }
-        try filter.finalize()
-        try disk.close()
         // Getting NVRAM
         Task { @MainActor in
             vmState = .downloading(text: "NVRAM", progress: 0)
@@ -261,7 +237,119 @@ class VMManager: NSObject, ObservableObject {
         }
         let nvramData = try await client.pullBlobData(digest: nvramLayer.digest)
         try nvramData.write(to: bundleForPaths.auxiliaryStorageURL)
+
+        // Fetching images
+
+        let chunkBasePath = bundleForPaths.url.appendingPathComponent("chunks")
+        try fileManager.createDirectory(at: chunkBasePath, withIntermediateDirectories: true)
+
+        let imgLayers = manifest.layers.filter { $0.mediaType == "application/vnd.cirruslabs.tart.disk.v1" }
+
+        resetProgressCounter(itemCount: imgLayers.count)
+
+        try await downloadAllLayers(imgLayers, to: chunkBasePath, using: client)
+        try await combineChunks(at: chunkBasePath, into: bundleForPaths.diskImageURL)
+
         try fileManager.removeItem(at: masterBundle.unfinishedURL)
+    }
+
+    @discardableResult
+    private func resetProgressCounter(itemCount: Int) -> Task<Void, Never> {
+        return Task { @MainActor in
+            progresses = Array(repeating: 0.0, count: itemCount)
+        }
+    }
+
+    private func downloadAllLayers(_ imgLayers: [Descriptor], to baseURL: URL, using client: OCI) async throws {
+        let taskLimitSemaphore = Semaphore(limit: 5)
+
+        // We use a task group to parallelize the download of separate chunks
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (index, layer) in imgLayers.enumerated() {
+                let chunkPath = baseURL.appendingPathComponent("\(index)").appendingPathExtension("chunk")
+
+                if fileManager.fileExists(atPath: chunkPath.path) {
+                    // If the existing file has the expected size, mark it as completed and continue
+                    let existingFileSize = try? fileManager.attributesOfItem(atPath: chunkPath.path)[.size] as? Int64
+                    if existingFileSize == layer.size {
+                        Task { @MainActor [weak self] in
+                            self?.progresses[index] = 1.0
+                        }
+                        continue
+                    } else {
+                        // Otherwise remove it to be re-downloaded
+                        try fileManager.removeItem(at: chunkPath)
+                    }
+                }
+
+                taskLimitSemaphore.wait()
+                group.addTask {
+                    defer { taskLimitSemaphore.signal() }
+
+                    self.fileManager.createFile(atPath: chunkPath.path, contents: nil)
+
+                    try await client.streamBlobData(digest: layer.digest, to: chunkPath, onProgress: { progress in
+                        Task { @MainActor [weak self] in
+                            self?.progresses[index] = (Double(progress) / Double(layer.size))
+
+                            let progressSum = self?.progresses.reduce(0.0, +) ?? 0.0
+                            let totalUnitCount = Double(self?.progresses.count ?? 1)
+
+                            let progressAverage = progressSum / totalUnitCount
+                            self?.vmState = .downloading(text: "disk image layers", progress: progressAverage)
+                        }
+                    })
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    private func combineChunks(at chunkBaseURL: URL, into combinedChunksURL: URL) async throws {
+        let bufferSizeBytes = 64 * 1024 * 1024
+
+        fileManager.createFile(atPath: combinedChunksURL.path, contents: nil)
+        let disk = try FileHandle(forWritingTo: combinedChunksURL)
+
+        let filter = try OutputFilter(.decompress, using: .lz4, bufferCapacity: bufferSizeBytes) { data in
+            if let data {
+                disk.write(data)
+            }
+        }
+
+        // Get the contents of the 'chunks' directory.
+        let chunkFiles = try! fileManager.contentsOfDirectory(at: chunkBaseURL, includingPropertiesForKeys: nil)
+
+        // Sort the URLs to make sure the chunks are processed in the correct order.
+        let sortedChunkFiles = chunkFiles.sorted(by: {
+            // We need to sort as Int and not String because sorting by string will result in the order: 0, 1, 10, 11, ...
+            Int($0.lastPathComponent.replacingOccurrences(of: ".chunk", with: ""))! <
+                Int($1.lastPathComponent.replacingOccurrences(of: ".chunk", with: ""))!
+        })
+
+        var buffer = [UInt8](repeating: 0, count: bufferSizeBytes)
+
+        for (index, chunkFile) in sortedChunkFiles.enumerated() {
+            DispatchQueue.main.async {
+                self.vmState = .decompressing(progress: Double(index) / Double(sortedChunkFiles.count))
+            }
+            if let inputStream = InputStream(url: chunkFile) {
+                inputStream.open()
+
+                while inputStream.hasBytesAvailable {
+                    let bytesRead = inputStream.read(&buffer, maxLength: bufferSizeBytes)
+                    if bytesRead > 0 {
+                        let data = Data(bytes: buffer, count: bytesRead)
+                        try filter.write(data)
+                    }
+                }
+
+                inputStream.close()
+            }
+        }
+
+        try filter.finalize()
+        disk.closeFile()
     }
 }
 
@@ -315,6 +403,23 @@ enum VMState {
     case provisioning
     case running(VZVirtualMachine)
     case downloading(text: String, progress: Double)
+    case decompressing(progress: Double)
     case legacyWarning(path: String)
     case legacyUpgradeFailed
+}
+
+class Semaphore {
+    private let semaphore: DispatchSemaphore
+
+    init(limit: Int) {
+        semaphore = DispatchSemaphore(value: limit)
+    }
+
+    func wait() {
+        semaphore.wait()
+    }
+
+    func signal() {
+        semaphore.signal()
+    }
 }

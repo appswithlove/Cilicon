@@ -1,4 +1,8 @@
+import AsyncHTTPClient
 import Foundation
+import NIOCore
+import NIOHTTP1
+
 public struct OCI {
     let url: OCIURL
 
@@ -37,6 +41,16 @@ public struct OCI {
         let blobUrl = baseURL.appending(path: "blobs/\(digest)")
         let (data, _) = try await request(authentication: authentication, url: blobUrl)
         return data
+    }
+
+    public func streamBlobData(
+        digest: String,
+        to targetURL: URL,
+        onProgress: @escaping (Int) -> Void,
+        authentication: AuthenticationType = .none
+    ) async throws {
+        let blobUrl = baseURL.appending(path: "blobs/\(digest)")
+        try await streamDownload(authentication: authentication, from: blobUrl, to: targetURL, onProgress: onProgress)
     }
 
     func authenticate(data: WWWAuthenticate) async throws -> String {
@@ -97,15 +111,62 @@ public struct OCI {
         guard let httpResp = response as? HTTPURLResponse else {
             fatalError() // not http
         }
-        if httpResp.statusCode == 401 {
-            guard let auth = WWWAuthenticate(response: httpResp) else { fatalError() }
-            let token = try await authenticate(data: auth)
-            return try await self.download(authentication: .bearer(token: token), url: url, headers: headers)
-        }
-        guard httpResp.statusCode == 200 else {
-            throw OCIError.generic
-        }
         return (data, httpResp)
+    }
+
+    func streamDownload(
+        authentication: AuthenticationType,
+        from url: URL,
+        to targetURL: URL,
+        onProgress: @escaping (Int) -> Void,
+        headers: [String: String] = [:]
+    ) async throws {
+        let client = HTTPClient(eventLoopGroupProvider: .singleton)
+        defer {
+            _ = client.shutdown()
+        }
+
+        var request = try HTTPClient.Request(url: url.absoluteString)
+        for (headerName, headerValue) in headers {
+            request.headers.replaceOrAdd(name: headerName, value: headerValue)
+        }
+        if case let .bearer(token) = authentication {
+            request.headers.replaceOrAdd(name: "Authorization", value: "Bearer \(token)")
+        }
+
+        var receivedResponseHead: HTTPResponseHead?
+        var responseHeadError: Error?
+
+        let delegate = try FileDownloadDelegate(path: targetURL.path, reportHead: { head in
+            receivedResponseHead = head
+            switch head.status.code {
+            case 401:
+                responseHeadError = OCIError.authenticationRequired
+            default:
+                responseHeadError = OCIError.generic
+            }
+        }, reportProgress: {
+            onProgress($0.receivedBytes)
+        })
+
+        do {
+            _ = try! await client.execute(request: request, delegate: delegate).get()
+            if let responseHeadError {
+                throw responseHeadError
+            }
+        } catch let error as OCIError {
+            if case .authenticationRequired = error,
+               let authHeader = receivedResponseHead?.headers.first(name: "www-authenticate") {
+                // Retry with authentication
+                guard let auth = WWWAuthenticate(authenticateHeaderField: authHeader) else {
+                    fatalError("Could not create auth header from response")
+                }
+                let token = try await authenticate(data: auth)
+                try await self.streamDownload(authentication: .bearer(token: token), from: url, to: targetURL, onProgress: onProgress)
+            } else {
+                throw error
+            }
+        }
     }
 
     public enum AuthenticationType {
@@ -121,4 +182,5 @@ struct AuthResponse: Decodable {
 
 enum OCIError: Error {
     case generic
+    case authenticationRequired
 }
